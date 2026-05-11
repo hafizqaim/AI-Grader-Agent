@@ -10,6 +10,31 @@ const { detectPlagiarism } = require("../services/detectPlagiarism");
 
 const router = express.Router();
 
+// ── Fix 2: Concurrency limiter ───────────────────────────────────────────────
+// Run at most CONCURRENCY_LIMIT AI calls simultaneously to avoid rate limits.
+const CONCURRENCY_LIMIT = 3;
+
+async function limitedParallel(items, asyncFn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await asyncFn(items[index], index);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(CONCURRENCY_LIMIT, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
+// ── Fix 7: Delete a file silently after use ──────────────────────────────────
+function deleteFile(filePath) {
+  try { fs.unlinkSync(filePath); } catch (_) { /* ignore */ }
+}
+
 // ── Multer configuration ────────────────────────────────────────────────────
 const ALLOWED_MIMETYPES = [
   "application/pdf",
@@ -28,45 +53,61 @@ const storage = multer.diskStorage({
 });
 
 const NAMING_FILE_EXTENSIONS = [".xlsx", ".xls", ".csv"];
+const ALLOWED_EXTENSIONS    = [".pdf", ".docx"];
 
+// Use extension-based checking as primary signal — browser mimetypes on Windows
+// are unreliable (DOCX often arrives as application/octet-stream).
 const fileFilter = (_req, file, cb) => {
+  const ext = path.extname(file.originalname).toLowerCase();
   if (file.fieldname === "namingFile") {
-    const ext = path.extname(file.originalname).toLowerCase();
     if (NAMING_FILE_EXTENSIONS.includes(ext)) {
       cb(null, true);
     } else {
-      cb(
-        new Error(`Naming file must be .xlsx, .xls, or .csv`),
-        false
-      );
+      cb(new Error(`Naming file must be .xlsx, .xls, or .csv`));
     }
-  } else if (ALLOWED_MIMETYPES.includes(file.mimetype)) {
-    cb(null, true);
   } else {
-    cb(
-      new Error(
-        `File "${file.originalname}" is not a supported format. Only PDF and DOCX files are accepted.`
-      ),
-      false
-    );
+    if (ALLOWED_EXTENSIONS.includes(ext) || ALLOWED_MIMETYPES.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(
+        `File "${file.originalname}" is not supported. Only PDF and DOCX files are accepted.`
+      ));
+    }
   }
 };
 
 const upload = multer({ storage, fileFilter });
 
-const uploadFields = upload.fields([
-  { name: "task", maxCount: 1 },
-  { name: "submissions", maxCount: 30 },
-  { name: "rubric", maxCount: 1 },
-  { name: "namingFile", maxCount: 1 },
-]);
+// ── Fix: use upload.any() to avoid LIMIT_UNEXPECTED_FILE from multer's
+// shared filesLeft counter bug in 1.4.x. Field names are validated manually.
+function makeUploadMiddleware() {
+  return upload.any();
+}
 
 // ── POST /api/grade ─────────────────────────────────────────────────────────
-router.post("/grade", uploadFields, async (req, res) => {
+router.post("/grade", (req, res, next) => {
+  console.log("[grade] multer middleware starting...");
+  makeUploadMiddleware()(req, res, (err) => {
+    console.log("[grade] multer callback fired, err =", err || "none");
+    if (!err) return next();
+    // Translate multer errors into clean JSON before they reach the global handler
+    const msg = err.code === "LIMIT_UNEXPECTED_FILE"
+      ? `Unexpected file field "${err.field}". Check that your form fields are named correctly.`
+      : err.message || "File upload error.";
+    console.error("[grade] multer error:", msg);
+    return res.status(400).json({ error: msg });
+  });
+}, async (req, res) => {
+  console.log("[grade] route handler reached, files:", JSON.stringify(Object.keys(req.files || {})));
   try {
-    const taskFile = req.files?.task?.[0];
-    const rubricFile = req.files?.rubric?.[0];
-    const submissionFiles = req.files?.submissions || [];
+    // upload.any() gives req.files as a flat array — group by fieldname manually
+    const allFiles = Array.isArray(req.files) ? req.files : [];
+    console.log("[grade] received fields:", allFiles.map(f => f.fieldname + ":" + f.originalname));
+    const taskFile       = allFiles.find(f => f.fieldname === "task");
+    const rubricFile     = allFiles.find(f => f.fieldname === "rubric");
+    const submissionFiles = allFiles.filter(f => f.fieldname === "submissions");
+    const namingFile     = allFiles.find(f => f.fieldname === "namingFile");
+    console.log(`[grade] task=${taskFile?.originalname}, rubric=${rubricFile?.originalname}, submissions=${submissionFiles.length}`);
 
     if (!taskFile) {
       return res.status(400).json({ error: "Assignment task file is required." });
@@ -77,8 +118,6 @@ router.post("/grade", uploadFields, async (req, res) => {
     if (submissionFiles.length === 0) {
       return res.status(400).json({ error: "At least one student submission is required." });
     }
-
-    const namingFile = req.files?.namingFile?.[0];
     if (!namingFile) {
       return res.status(400).json({ error: "Naming file (Excel/CSV) is required." });
     }
@@ -96,33 +135,86 @@ router.post("/grade", uploadFields, async (req, res) => {
       parseFile(rubricFile.path, rubricFile.mimetype),
     ]);
 
+    // Fix 7: clean up task & rubric uploads immediately after extraction
+    deleteFile(taskFile.path);
+    deleteFile(rubricFile.path);
+
     // Parse all submission texts first (needed for both grading and plagiarism)
     const submissionData = await Promise.all(
-      submissionFiles.map(async (file) => ({
-        name: path.basename(file.originalname, path.extname(file.originalname)),
-        text: await parseFile(file.path, file.mimetype),
-        file,
-      }))
+      submissionFiles.map(async (file) => {
+        const text = await parseFile(file.path, file.mimetype);
+        deleteFile(file.path); // Fix 7: clean up submission upload immediately
+        return {
+          name: path.basename(file.originalname, path.extname(file.originalname)),
+          text,
+        };
+      })
     );
 
-    // Run plagiarism detection (pure text comparison, no AI call needed)
+    // Fix 4: warn about empty submissions (scanned / image-only PDFs)
+    const emptySubmissions = submissionData.filter((s) => s.text.trim().length < 50);
+    if (emptySubmissions.length > 0) {
+      const names = emptySubmissions.map((s) => s.name).join(", ");
+      return res.status(400).json({
+        error: `Could not extract readable text from the following submission(s): ${names}. ` +
+               `These files may be scanned images or image-only PDFs. ` +
+               `Please upload text-based PDF or DOCX files.`,
+      });
+    }
+
+    // Grade ALL submissions including re-uploads — best score per student is kept below
+    const total = submissionData.length;
+    let done = 0;
+    console.log(`[grade] grading all ${total} submissions to find best per student...`);
+    const allGrades = await limitedParallel(submissionData, async ({ name, text }) => {
+      const result = await gradeWithAI({ taskText, submissionText: text, rubricText, studentName: name });
+      done++;
+      console.log(`[grade] graded ${done}/${total}: ${name}`);
+      // Carry the submission text forward so we can run plagiarism on the winning version
+      return { ...result, _submissionText: text };
+    });
+
+    // Keep only the highest-scoring submission per roll number.
+    // Roll key = filename without trailing LMS re-upload suffixes like (1), (2) ...
+    const bestMap = new Map();
+    for (const grade of allGrades) {
+      const rollKey = grade.studentName.replace(/\s*\(\d+\)$/, "").trim().toUpperCase();
+      const existing = bestMap.get(rollKey);
+      if (!existing || grade.totalScore > existing.totalScore) {
+        bestMap.set(rollKey, grade);
+      }
+    }
+    const bestGrades = [...bestMap.values()];
+    if (bestGrades.length < allGrades.length) {
+      console.log(`[grade] best-version selection: ${allGrades.length} submissions → ${bestGrades.length} unique students`);
+    }
+
+    // Run plagiarism only on the best (winning) version of each student
+    console.log("[grade] running plagiarism detection on best versions...");
     const plagiarism = detectPlagiarism(
-      submissionData.map((s) => ({ name: s.name, text: s.text }))
+      bestGrades.map((g) => ({ name: g.studentName, text: g._submissionText }))
     );
+    console.log(`[grade] plagiarism done, ${plagiarism.length} pairs flagged`);
 
-    // Grade all submissions in parallel; student name = filename without extension
-    const gradingPromises = submissionData.map(({ name, text }) =>
-      gradeWithAI({ taskText, submissionText: text, rubricText, studentName: name })
-    );
+    // Strip internal text field before sending to client / report
+    const grades = bestGrades.map(({ _submissionText, ...g }) => g);
+    console.log(`[grade] AI grading done, ${grades.length} results`);
 
-    const grades = await Promise.all(gradingPromises);
+    // Ensure reports directory exists
+    const reportsDir = path.join(__dirname, "..", "reports");
+    if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
 
     // Generate the DOCX report and update the naming file with marks
+    console.log("[grade] generating reports...");
     await Promise.all([
       generateReport(grades),
       updateNamingFile(namingFile.path, grades, markColumnIndex),
     ]);
 
+    // Fix 7: clean up naming file upload after it has been read
+    deleteFile(namingFile.path);
+
+    console.log("[grade] done — sending response");
     return res.json({ grades, plagiarism });
   } catch (err) {
     console.error("Grading error:", err);

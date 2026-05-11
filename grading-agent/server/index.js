@@ -7,14 +7,21 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ── Middleware ───────────────────────────────────────────────────────────────
-app.use(
-  cors({
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"],
-  })
-);
+const corsOptions = {
+  origin: "http://localhost:5173",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // handle preflight for all routes
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ── Request logger (dev only) ─────────────────────────────────────────────────
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.use("/api", gradeRouter);
