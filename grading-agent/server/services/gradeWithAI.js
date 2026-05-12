@@ -1,14 +1,15 @@
 const OpenAI = require("openai");
 
-// Ollama runs locally — OpenAI-compatible API, no key required.
+// Ollama endpoint — set OLLAMA_BASE_URL in .env to use a remote instance (e.g. Colab+ngrok).
+// Falls back to local Ollama if not set.
 const client = new OpenAI({
-  baseURL: "http://localhost:11434/v1",
-  apiKey: "ollama",   // required by SDK but ignored by Ollama
-  timeout: 5 * 60 * 1000, // 5-minute per-call timeout
+  baseURL: (process.env.OLLAMA_BASE_URL || "http://localhost:11434") + "/v1",
+  apiKey: "ollama",
+  timeout: 10 * 60 * 1000,
 });
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const MODEL_NAME    = "llama3.2:3b";
+const MODEL_NAME    = "mistral:7b";
 const MAX_TOKENS    = 2000;  // tokens reserved for the JSON response
 const MAX_RETRIES   = 3;
 const INITIAL_DELAY = 2000; // ms — local model, shorter waits
@@ -25,10 +26,19 @@ function truncate(text, limit) {
   return text.slice(0, limit) + "\n[...truncated to fit context limit...]";
 }
 
-// System prompt kept as a constant so teachers can easily tweak grading behaviour
-const GRADING_SYSTEM_PROMPT = `You are an expert academic grader. Your job is to evaluate a student's assignment submission fairly and thoroughly based on the provided rubric.
+// System prompt — explicit about using ONLY the rubric's criteria, no invention
+const GRADING_SYSTEM_PROMPT = `You are a strict academic grader. Evaluate the student submission using ONLY the criteria listed in the rubric.
 
-Always respond in the following strict JSON format with no extra text:
+CRITICAL RULES:
+1. The "criteria" array MUST contain EXACTLY ONE entry per question/criterion in the rubric — no more, no less.
+2. Do NOT invent, merge, or skip any criterion. Use the exact criterion names from the rubric.
+3. Every criterion entry MUST include "maxScore" — read it directly from the rubric. NEVER omit or set it to 0 unless the rubric says 0.
+4. "score" must be between 0 and "maxScore" for that criterion.
+5. "totalScore" MUST equal the exact arithmetic sum of all criterion "score" values.
+6. "maxScore" at the top level MUST equal the exact arithmetic sum of all criterion "maxScore" values.
+7. Return ONLY a single flat JSON object — no nested objects, no markdown fences, no explanation.
+
+Required JSON format (copy this structure exactly):
 {
   "studentName": "<name>",
   "totalScore": <number>,
@@ -37,39 +47,107 @@ Always respond in the following strict JSON format with no extra text:
   "grade": "<A/B/C/D/F>",
   "overallComment": "<2-3 sentence summary>",
   "criteria": [
-    {
-      "name": "<criterion name>",
-      "score": <number awarded>,
-      "maxScore": <number>,
-      "feedback": "<2-3 sentences explaining the score>"
-    }
+    { "name": "<criterion 1 name>", "score": <number>, "maxScore": <number from rubric>, "feedback": "<feedback>" },
+    { "name": "<criterion 2 name>", "score": <number>, "maxScore": <number from rubric>, "feedback": "<feedback>" }
   ]
 }`;
 
-// ── Fix 3: Validate and correct the AI's JSON output ────────────────────────
+// ── Deep-scan an object to extract criterion-like entries ───────────────────
+// Handles models that nest criteria inside a sub-object instead of a flat array.
+function extractCriteria(obj) {
+  if (!obj || typeof obj !== "object") return [];
+  if (Array.isArray(obj)) {
+    // Already an array — flatten any nested arrays and return flat criterion objects
+    return obj.flatMap((item) =>
+      item && typeof item === "object" && ("score" in item || "Score" in item)
+        ? [item]
+        : extractCriteria(item)
+    );
+  }
+  // It's a plain object — check if every value looks like a criterion
+  const entries = Object.entries(obj);
+  const results = [];
+  for (const [key, val] of entries) {
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const hasScore = "score" in val || "Score" in val;
+      if (hasScore) {
+        // This key is a criterion name; val holds its properties
+        results.push({
+          name:     val.name || key,
+          score:    Number(val.score ?? val.Score) || 0,
+          maxScore: Number(val.maxScore ?? val.MaxScore ?? val.max_score ?? val.marks ?? val.Marks) || 0,
+          feedback: val.feedback || val.Feedback || val.Response || val.response || val.comment || "",
+        });
+      } else {
+        // Recurse one level deeper (e.g. model wrapped criteria in "Assignment(2)": {...})
+        const nested = extractCriteria(val);
+        if (nested.length > 0) results.push(...nested);
+      }
+    }
+  }
+  return results;
+}
+
+// ── Validate and correct the AI's JSON output ───────────────────────────────
 function validateAndCorrect(data, studentName) {
-  // Recompute percentage from actual scores — don't trust AI arithmetic
-  if (typeof data.totalScore === "number" && typeof data.maxScore === "number" && data.maxScore > 0) {
-    data.percentage = Math.round((data.totalScore / data.maxScore) * 1000) / 10;
+  // Always use the canonical student name (from the filename)
+  data.studentName = studentName;
+
+  // Normalise criteria — handle array, plain object, or deeply nested structures
+  if (!Array.isArray(data.criteria)) {
+    if (data.criteria && typeof data.criteria === "object") {
+      // Try Object.values first (simple object map)
+      const vals = Object.values(data.criteria);
+      if (vals.length > 0 && vals.every((v) => v && typeof v === "object" && ("score" in v || "Score" in v))) {
+        data.criteria = vals;
+      } else {
+        data.criteria = extractCriteria(data.criteria);
+      }
+    } else {
+      // criteria missing entirely — try to extract from the whole response object
+      data.criteria = extractCriteria(data);
+    }
+  }
+  if (!Array.isArray(data.criteria)) data.criteria = [];
+
+  // Coerce types; only clamp score ≤ maxScore when maxScore is actually known (> 0)
+  data.criteria = data.criteria.map((c) => {
+    const score    = Number(c.score ?? c.Score) || 0;
+    const maxScore = Number(c.maxScore ?? c.MaxScore ?? c.max_score) || 0;
+    return {
+      ...c,
+      name:     c.name || "",
+      score:    maxScore > 0 ? Math.min(score, maxScore) : score,
+      maxScore,
+      feedback: c.feedback || c.Feedback || c.Response || c.response || "",
+    };
+  });
+
+  // Recompute totalScore and maxScore from criteria — never trust the model's arithmetic
+  if (data.criteria.length > 0) {
+    data.totalScore = data.criteria.reduce((sum, c) => sum + c.score,    0);
+    data.maxScore   = data.criteria.reduce((sum, c) => sum + c.maxScore, 0);
+  } else {
+    data.totalScore = Number(data.totalScore) || 0;
+    data.maxScore   = Number(data.maxScore)   || 0;
   }
 
+  // Recompute percentage
+  data.percentage = data.maxScore > 0
+    ? Math.round((data.totalScore / data.maxScore) * 1000) / 10
+    : 0;
+
   // Derive grade letter from corrected percentage
-  const pct = data.percentage || 0;
+  const pct = data.percentage;
   if      (pct >= 90) data.grade = "A";
   else if (pct >= 75) data.grade = "B";
   else if (pct >= 60) data.grade = "C";
   else if (pct >= 50) data.grade = "D";
   else                data.grade = "F";
 
-  // Always use the canonical student name (from the filename)
-  data.studentName = studentName;
-
-  // Clamp criterion scores so they never exceed their own maxScore
-  if (Array.isArray(data.criteria)) {
-    data.criteria = data.criteria.map((c) => ({
-      ...c,
-      score: Math.min(Number(c.score) || 0, Number(c.maxScore) || 0),
-    }));
+  // Warn if maxScore looks suspiciously wrong (criteria all had maxScore=0)
+  if (data.criteria.length > 0 && data.maxScore === 0) {
+    console.warn(`[validateAndCorrect] WARNING: "${data.studentName}" — all criteria have maxScore=0. The model likely omitted maxScores. Scores may be unreliable.`);
   }
 
   return data;
@@ -84,14 +162,16 @@ async function withRetry(fn, retries = MAX_RETRIES, delay = INITIAL_DELAY) {
       if (err?.code === "ECONNREFUSED") {
         throw new Error(
           "Cannot connect to Ollama. Make sure Ollama is running (`ollama serve`) " +
-          "and the model is pulled (`ollama pull llama3.2:3b`)."
+          "and the model is pulled (`ollama pull mistral:7b`)."
         );
       }
 
       const isTransient =
         err?.status === 429 ||
+        err?.status === 500 || // Ollama runner crash — wait and retry
         String(err?.message).toLowerCase().includes("rate") ||
-        String(err?.message).toLowerCase().includes("quota");
+        String(err?.message).toLowerCase().includes("quota") ||
+        String(err?.message).toLowerCase().includes("terminated");
 
       if (!isTransient || attempt === retries) throw err;
 
@@ -99,6 +179,48 @@ async function withRetry(fn, retries = MAX_RETRIES, delay = INITIAL_DELAY) {
       console.warn(`Attempt ${attempt} failed. Retrying in ${wait / 1000}s…`);
       await new Promise((res) => setTimeout(res, wait));
     }
+  }
+}
+
+/**
+ * Asks the model to repair a malformed JSON response into the required format.
+ * Returns a parsed object on success, or null on failure.
+ */
+async function repairJSON(brokenText, studentName) {
+  const repairPrompt = `The text below was supposed to be a JSON grading result but has syntax errors or the wrong structure.
+Rewrite it as valid JSON matching EXACTLY this format — no extra keys, no markdown:
+{
+  "studentName": "${studentName}",
+  "totalScore": <number>,
+  "maxScore": <number>,
+  "percentage": <number>,
+  "grade": "<A/B/C/D/F>",
+  "overallComment": "<2-3 sentence summary>",
+  "criteria": [
+    { "name": "<criterion name>", "score": <number>, "maxScore": <number>, "feedback": "<feedback>" }
+  ]
+}
+
+Broken text:
+${brokenText}
+
+Return ONLY the corrected JSON, nothing else.`;
+
+  try {
+    const response = await client.chat.completions.create({
+      model: MODEL_NAME,
+      max_tokens: MAX_TOKENS,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "You fix broken JSON. Return only valid JSON, nothing else." },
+        { role: "user",   content: repairPrompt },
+      ],
+    });
+    const text = response.choices[0].message.content.trim()
+      .replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
   }
 }
 
@@ -129,7 +251,10 @@ ${studentName}
 ## Student Submission
 ${safeSubmission}
 
-Grade this submission criterion by criterion strictly according to the rubric. Return only valid JSON.`;
+STEP 1 — Before writing any JSON, silently count the number of distinct criteria/questions in the rubric above. Write down that count.
+STEP 2 — Your "criteria" array MUST have EXACTLY that many entries — one per rubric criterion, no more, no less.
+STEP 3 — For each criterion, read its maxScore directly from the rubric. NEVER leave maxScore as 0 unless the rubric explicitly gives it 0 marks.
+STEP 4 — Return ONLY the final JSON object. No markdown, no explanation, no extra keys.`;
 
   const rawText = await withRetry(async () => {
     const response = await client.chat.completions.create({
@@ -150,10 +275,26 @@ Grade this submission criterion by criterion strictly according to the rubric. R
   let parsed;
   try {
     parsed = JSON.parse(jsonText);
-  } catch (err) {
-    throw new Error(
-      `AI returned malformed JSON for student "${studentName}".\n\nRaw response:\n${rawText}`
-    );
+  } catch (_parseErr) {
+    // The model returned broken JSON — ask it to repair itself (one extra attempt)
+    console.warn(`[gradeWithAI] malformed JSON for "${studentName}", attempting repair…`);
+    const repaired = await repairJSON(rawText, studentName);
+    if (repaired) {
+      parsed = repaired;
+    } else {
+      // Repair also failed — return a fallback so the rest of the batch continues
+      console.error(`[gradeWithAI] repair failed for "${studentName}", returning fallback grade`);
+      return {
+        studentName,
+        totalScore: 0,
+        maxScore: 0,
+        percentage: 0,
+        grade: "F",
+        overallComment: "Grading could not be completed — the AI returned an unreadable response. Please re-grade this student manually.",
+        criteria: [],
+        error: true,
+      };
+    }
   }
 
   return validateAndCorrect(parsed, studentName);

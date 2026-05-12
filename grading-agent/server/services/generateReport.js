@@ -72,7 +72,10 @@ async function generateReport(results) {
       ],
     });
 
-    const dataRows = (result.criteria || []).map(
+    const criteriaList = Array.isArray(result.criteria)
+      ? result.criteria
+      : result.criteria ? Object.values(result.criteria) : [];
+    const dataRows = criteriaList.map(
       (criterion) =>
         new TableRow({
           children: [

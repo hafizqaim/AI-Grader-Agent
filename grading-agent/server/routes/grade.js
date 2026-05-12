@@ -11,8 +11,8 @@ const { detectPlagiarism } = require("../services/detectPlagiarism");
 const router = express.Router();
 
 // ── Fix 2: Concurrency limiter ───────────────────────────────────────────────
-// Run at most CONCURRENCY_LIMIT AI calls simultaneously to avoid rate limits.
-const CONCURRENCY_LIMIT = 3;
+// 1 for local Ollama on 4GB GPU; increase to 3 when using Colab/remote Ollama.
+const CONCURRENCY_LIMIT = parseInt(process.env.OLLAMA_CONCURRENCY || "1", 10);
 
 async function limitedParallel(items, asyncFn) {
   const results = new Array(items.length);
@@ -192,13 +192,21 @@ router.post("/grade", (req, res, next) => {
     // Run plagiarism only on the best (winning) version of each student
     console.log("[grade] running plagiarism detection on best versions...");
     const plagiarism = detectPlagiarism(
-      bestGrades.map((g) => ({ name: g.studentName, text: g._submissionText }))
+      bestGrades.filter(g => !g.error).map((g) => ({ name: g.studentName, text: g._submissionText }))
     );
     console.log(`[grade] plagiarism done, ${plagiarism.length} pairs flagged`);
 
     // Strip internal text field before sending to client / report
     const grades = bestGrades.map(({ _submissionText, ...g }) => g);
-    console.log(`[grade] AI grading done, ${grades.length} results`);
+
+    // Separate successfully graded from fallback-error results
+    const successGrades = grades.filter(g => !g.error);
+    const errorGrades   = grades.filter(g => g.error);
+    if (errorGrades.length > 0) {
+      console.warn(`[grade] ${errorGrades.length} student(s) could not be graded:`,
+        errorGrades.map(g => g.studentName).join(", "));
+    }
+    console.log(`[grade] AI grading done, ${successGrades.length} results (${errorGrades.length} errors)`);
 
     // Ensure reports directory exists
     const reportsDir = path.join(__dirname, "..", "reports");
@@ -207,15 +215,15 @@ router.post("/grade", (req, res, next) => {
     // Generate the DOCX report and update the naming file with marks
     console.log("[grade] generating reports...");
     await Promise.all([
-      generateReport(grades),
-      updateNamingFile(namingFile.path, grades, markColumnIndex),
+      generateReport(successGrades),
+      updateNamingFile(namingFile.path, successGrades, markColumnIndex),
     ]);
 
     // Fix 7: clean up naming file upload after it has been read
     deleteFile(namingFile.path);
 
     console.log("[grade] done — sending response");
-    return res.json({ grades, plagiarism });
+    return res.json({ grades: successGrades, errorGrades, plagiarism });
   } catch (err) {
     console.error("Grading error:", err);
     return res.status(500).json({ error: err.message || "An unexpected error occurred." });
