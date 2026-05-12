@@ -79,10 +79,10 @@ export default function PlagiarismReport({ pairs }) {
                 </div>
               </div>
 
-              {/* Similarity bar + badge */}
-              <div className="flex flex-col gap-1 sm:w-56">
+              {/* Similarity bar + scores */}
+              <div className="flex flex-col gap-1 sm:w-64">
                 <div className="flex items-center justify-between text-xs text-gray-500">
-                  <span>Similarity</span>
+                  <span>Overall Similarity</span>
                   <span className="font-bold text-gray-800">{pair.similarity}%</span>
                 </div>
                 <div className="h-2.5 w-full overflow-hidden rounded-full bg-gray-100">
@@ -91,19 +91,29 @@ export default function PlagiarismReport({ pairs }) {
                     style={{ width: `${pair.similarity}%` }}
                   />
                 </div>
+                {/* Individual method scores */}
+                <div className="flex justify-between text-xs text-gray-400 mt-0.5">
+                  <span>Verbatim: <span className="font-medium text-gray-600">{pair.jaccardScore}%</span></span>
+                  <span>Paraphrase: <span className="font-medium text-gray-600">{pair.tfidfScore}%</span></span>
+                </div>
               </div>
 
-              {/* Severity badge */}
-              <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold ring-1 ring-inset ${style.badge}`}>
-                {style.label}
-              </span>
+              {/* Severity + method badges */}
+              <div className="flex flex-col items-end gap-1.5 shrink-0">
+                <span className={`rounded-full px-3 py-1 text-xs font-bold ring-1 ring-inset ${style.badge}`}>
+                  {style.label}
+                </span>
+                <span className="rounded-full bg-gray-100 text-gray-600 px-2 py-0.5 text-xs font-medium">
+                  {pair.method}
+                </span>
+              </div>
             </div>
           </div>
         );
       })}
 
       <p className="text-xs text-gray-400 text-right">
-        Detection method: word-level k-shingle Jaccard similarity &nbsp;|&nbsp; Threshold ≥ 20%
+        Detection: Jaccard k-shingle (verbatim) + TF-IDF cosine (paraphrase) &nbsp;|&nbsp; Threshold ≥ 20%
       </p>
     </section>
   );

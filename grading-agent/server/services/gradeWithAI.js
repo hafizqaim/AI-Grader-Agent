@@ -9,17 +9,20 @@ const client = new OpenAI({
 });
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const MODEL_NAME    = "mistral:7b";
-const MAX_TOKENS    = 2000;  // tokens reserved for the JSON response
+// qwen2.5:14b — best fit for Colab T4 (15 GB VRAM, ~9 GB used).
+// Much stronger at structured JSON output and instruction-following than mistral:7b.
+// Falls back gracefully to mistral:7b if MODEL_NAME is overridden via env var.
+const MODEL_NAME    = process.env.OLLAMA_MODEL || "qwen2.5:14b";
+const MAX_TOKENS    = 3000;  // larger model can produce richer responses
 const MAX_RETRIES   = 3;
-const INITIAL_DELAY = 2000; // ms — local model, shorter waits
+const INITIAL_DELAY = 2000;
 
-// Llama 3.2 3B has a 128K context but quality drops on very long inputs.
-// Keep inputs focused: ~4 chars per token, budget ~6000 input tokens.
-const INPUT_CHAR_BUDGET     = 6000 * 4; // ≈ 24 000 chars
-const RUBRIC_CHAR_LIMIT     = Math.floor(INPUT_CHAR_BUDGET * 0.25); // ~6 000
-const TASK_CHAR_LIMIT       = Math.floor(INPUT_CHAR_BUDGET * 0.20); // ~4 800
-const SUBMISSION_CHAR_LIMIT = Math.floor(INPUT_CHAR_BUDGET * 0.55); // ~13 200
+// qwen2.5:14b supports 32K context; keep inputs focused for quality.
+// ~4 chars per token, budget ~8000 input tokens.
+const INPUT_CHAR_BUDGET     = 8000 * 4; // ≈ 32 000 chars
+const RUBRIC_CHAR_LIMIT     = Math.floor(INPUT_CHAR_BUDGET * 0.25); // ~8 000
+const TASK_CHAR_LIMIT       = Math.floor(INPUT_CHAR_BUDGET * 0.20); // ~6 400
+const SUBMISSION_CHAR_LIMIT = Math.floor(INPUT_CHAR_BUDGET * 0.55); // ~17 600
 
 function truncate(text, limit) {
   if (text.length <= limit) return text;
@@ -145,10 +148,15 @@ function validateAndCorrect(data, studentName) {
   else if (pct >= 50) data.grade = "D";
   else                data.grade = "F";
 
-  // Warn if maxScore looks suspiciously wrong (criteria all had maxScore=0)
+  // Warn if all criteria have maxScore=0 (model omitted them)
   if (data.criteria.length > 0 && data.maxScore === 0) {
     console.warn(`[validateAndCorrect] WARNING: "${data.studentName}" — all criteria have maxScore=0. The model likely omitted maxScores. Scores may be unreliable.`);
   }
+
+  // Note: we do NOT enforce a strict criterion count because a student may
+  // legitimately split one question into sub-parts (e.g. Q1a + Q1b).
+  // The important invariant is that totalScore/maxScore is computed from the
+  // actual criteria list, which is enforced above.
 
   return data;
 }

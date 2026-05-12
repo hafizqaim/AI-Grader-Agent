@@ -42,11 +42,18 @@ export default function App() {
 
     setLoading(true);
     try {
-      const { data } = await axios.post(`${API_BASE}/grade`, formData, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
+      const { data } = await axios.post(`${API_BASE}/grade`, formData);
+      // Note: do NOT set Content-Type manually for FormData — the browser must
+      // set it automatically so it includes the correct multipart boundary.
       setResults(data.grades);
       setPlagiarism(data.plagiarism || []);
+      if (data.errorGrades?.length > 0) {
+        setError(
+          `⚠️ ${data.errorGrades.length} submission(s) could not be graded (AI returned an unreadable response): ` +
+          data.errorGrades.map(g => g.studentName).join(", ") +
+          ". All other students were graded successfully."
+        );
+      }
     } catch (err) {
       const msg =
         err.response?.data?.error ||
@@ -73,7 +80,7 @@ export default function App() {
           <span className="text-3xl">🎓</span>
           <div>
             <h1 className="text-2xl font-extrabold text-gray-900 leading-tight">AI Assignment Grader</h1>
-            <p className="text-sm text-gray-500">Powered by Gemini AI</p>
+            <p className="text-sm text-gray-500">Powered by Llama 3.2 (Ollama)</p>
           </div>
         </div>
       </header>
