@@ -12,7 +12,9 @@ export default function App() {
   const [rubricFile, setRubricFile] = useState(null);
   const [submissionFiles, setSubmissionFiles] = useState([]);
   const [namingFile, setNamingFile] = useState(null);
+  const [modelAnswerFile, setModelAnswerFile] = useState(null);
   const [markColumn, setMarkColumn] = useState("");
+  const [totalMarks, setTotalMarks] = useState("");
   const [results, setResults] = useState([]);
   const [plagiarism, setPlagiarism] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -39,6 +41,12 @@ export default function App() {
     submissionFiles.forEach((f) => formData.append("submissions", f));
     formData.append("namingFile", namingFile);
     formData.append("markColumn", markColumn);
+    if (totalMarks && parseInt(totalMarks) > 0) {
+      formData.append("totalMarks", totalMarks);
+    }
+    if (modelAnswerFile) {
+      formData.append("modelAnswer", modelAnswerFile);
+    }
 
     setLoading(true);
     try {
@@ -80,7 +88,7 @@ export default function App() {
           <span className="text-3xl">🎓</span>
           <div>
             <h1 className="text-2xl font-extrabold text-gray-900 leading-tight">AI Assignment Grader</h1>
-            <p className="text-sm text-gray-500">Powered by Llama 3.2 (Ollama)</p>
+            <p className="text-sm text-gray-500">Powered by Qwen2.5 14B (Ollama)</p>
           </div>
         </div>
       </header>
@@ -113,7 +121,14 @@ export default function App() {
               onChange={setSubmissionFiles}
             />
 
-            <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+            <FileUploader
+              label="Model Answer / Solution (PDF / DOCX) — optional but improves grading accuracy"
+              accept=".pdf,.docx"
+              multiple={false}
+              onChange={setModelAnswerFile}
+            />
+
+            <div className="grid grid-cols-1 gap-6 sm:grid-cols-4">
               <div className="sm:col-span-2">
                 <FileUploader
                   label="Naming File — roll numbers &amp; student data (XLSX / CSV)"
@@ -136,6 +151,21 @@ export default function App() {
                   className="rounded-xl border border-gray-300 px-4 py-3 text-sm text-gray-800 placeholder-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
                 />
                 <p className="text-xs text-gray-400">Column 1 = first column (A)</p>
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-sm font-semibold text-gray-700">
+                  Total Marks
+                  <span className="ml-1 font-normal text-gray-400">(optional)</span>
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  placeholder="e.g. 20"
+                  value={totalMarks}
+                  onChange={(e) => setTotalMarks(e.target.value)}
+                  className="rounded-xl border border-gray-300 px-4 py-3 text-sm text-gray-800 placeholder-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                />
+                <p className="text-xs text-gray-400">If rubric has no marks listed</p>
               </div>
             </div>
 

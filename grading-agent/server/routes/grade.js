@@ -103,11 +103,12 @@ router.post("/grade", (req, res, next) => {
     // upload.any() gives req.files as a flat array — group by fieldname manually
     const allFiles = Array.isArray(req.files) ? req.files : [];
     console.log("[grade] received fields:", allFiles.map(f => f.fieldname + ":" + f.originalname));
-    const taskFile       = allFiles.find(f => f.fieldname === "task");
-    const rubricFile     = allFiles.find(f => f.fieldname === "rubric");
+    const taskFile        = allFiles.find(f => f.fieldname === "task");
+    const rubricFile      = allFiles.find(f => f.fieldname === "rubric");
     const submissionFiles = allFiles.filter(f => f.fieldname === "submissions");
-    const namingFile     = allFiles.find(f => f.fieldname === "namingFile");
-    console.log(`[grade] task=${taskFile?.originalname}, rubric=${rubricFile?.originalname}, submissions=${submissionFiles.length}`);
+    const namingFile      = allFiles.find(f => f.fieldname === "namingFile");
+    const modelAnswerFile = allFiles.find(f => f.fieldname === "modelAnswer"); // optional
+    console.log(`[grade] task=${taskFile?.originalname}, rubric=${rubricFile?.originalname}, submissions=${submissionFiles.length}, modelAnswer=${modelAnswerFile?.originalname || "none"}`);
 
     if (!taskFile) {
       return res.status(400).json({ error: "Assignment task file is required." });
@@ -129,15 +130,21 @@ router.post("/grade", (req, res, next) => {
     // Convert to 0-based index
     const markColumnIndex = markColumn - 1;
 
-    // Parse task and rubric
-    const [taskText, rubricText] = await Promise.all([
+    // Optional total marks for the assignment — used to tell the AI how to distribute maxScores
+    // when the rubric doesn't list explicit marks per criterion.
+    const totalMarks = parseInt(req.body.totalMarks, 10) || null;
+
+    // Parse task, rubric, and (optionally) model answer
+    const [taskText, rubricText, modelAnswerText] = await Promise.all([
       parseFile(taskFile.path, taskFile.mimetype),
       parseFile(rubricFile.path, rubricFile.mimetype),
+      modelAnswerFile ? parseFile(modelAnswerFile.path, modelAnswerFile.mimetype) : Promise.resolve(null),
     ]);
 
-    // Fix 7: clean up task & rubric uploads immediately after extraction
+    // Fix 7: clean up task, rubric, and model answer uploads immediately after extraction
     deleteFile(taskFile.path);
     deleteFile(rubricFile.path);
+    if (modelAnswerFile) deleteFile(modelAnswerFile.path);
 
     // Parse all submission texts first (needed for both grading and plagiarism)
     const submissionData = await Promise.all(
@@ -167,7 +174,7 @@ router.post("/grade", (req, res, next) => {
     let done = 0;
     console.log(`[grade] grading all ${total} submissions to find best per student...`);
     const allGrades = await limitedParallel(submissionData, async ({ name, text }) => {
-      const result = await gradeWithAI({ taskText, submissionText: text, rubricText, studentName: name });
+      const result = await gradeWithAI({ taskText, submissionText: text, rubricText, studentName: name, totalMarks, modelAnswerText });
       done++;
       console.log(`[grade] graded ${done}/${total}: ${name}`);
       // Carry the submission text forward so we can run plagiarism on the winning version

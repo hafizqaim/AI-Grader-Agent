@@ -17,29 +17,137 @@ const MAX_TOKENS    = 3000;  // larger model can produce richer responses
 const MAX_RETRIES   = 3;
 const INITIAL_DELAY = 2000;
 
-// qwen2.5:14b supports 32K context; keep inputs focused for quality.
-// ~4 chars per token, budget ~8000 input tokens.
-const INPUT_CHAR_BUDGET     = 8000 * 4; // ≈ 32 000 chars
-const RUBRIC_CHAR_LIMIT     = Math.floor(INPUT_CHAR_BUDGET * 0.25); // ~8 000
-const TASK_CHAR_LIMIT       = Math.floor(INPUT_CHAR_BUDGET * 0.20); // ~6 400
-const SUBMISSION_CHAR_LIMIT = Math.floor(INPUT_CHAR_BUDGET * 0.55); // ~17 600
+// qwen2.5:14b supports 32K context tokens — ~4 chars/token → 128K char budget.
+// Distribute generously so long rubrics (with narrative model answers) are never truncated.
+const INPUT_CHAR_BUDGET       = 32000 * 4;                            // ≈ 128 000 chars
+const RUBRIC_CHAR_LIMIT       = Math.floor(INPUT_CHAR_BUDGET * 0.30); // ~38 400 chars
+const TASK_CHAR_LIMIT         = Math.floor(INPUT_CHAR_BUDGET * 0.15); // ~19 200 chars
+const MODEL_ANSWER_CHAR_LIMIT = Math.floor(INPUT_CHAR_BUDGET * 0.20); // ~25 600 chars
+const SUBMISSION_CHAR_LIMIT   = Math.floor(INPUT_CHAR_BUDGET * 0.35); // ~44 800 chars
 
 function truncate(text, limit) {
   if (text.length <= limit) return text;
   return text.slice(0, limit) + "\n[...truncated to fit context limit...]";
 }
 
-// System prompt — explicit about using ONLY the rubric's criteria, no invention
+// ── Rubric table cleaner ──────────────────────────────────────────────────────
+// Mammoth extracts DOCX tables as plain text rows (one cell per line), producing:
+//   Criteria\nMarks\nExcellent...\n<criterion name>\n10\n<descriptions...>
+// This function locates every "Rubric – Question N" section, extracts the
+// criterion+marks pairs, deduplicates them, and prepends a clean summary.
+function cleanRubricText(text) {
+  const rubricHeadingRe = /Rubric\s*[–\-—]\s*Question\s*\d+/gi;
+  // Table header noise rows — column headers or summary table labels, not criteria
+  const headerNoise = /^(criteria|marks|excellent|good|adequate|poor|satisfactory|unsatisfactory|outstanding|needs improvement|max marks|maximum marks|total marks|overall marks|key evaluation focus|evaluation focus|overall assessment|question)\b/i;
+  // Patterns that indicate we've left the per-question rubric section and hit a summary table
+  const summaryTableRe = /^(overall\s+grading|grade\s+summary|summary\s+table|total\s+marks|assessment\s+summary|final\s+marks)/i;
+
+  const sectionStarts = [];
+  let m;
+  while ((m = rubricHeadingRe.exec(text)) !== null) {
+    sectionStarts.push(m.index);
+  }
+
+  if (sectionStarts.length === 0) return text; // no rubric tables found
+
+  // Also collect narrative "Question N:" headings to use as section end markers
+  const narrativeHeadingRe = /^Question\s+\d+\s*:/gim;
+  const narrativeStarts = [];
+  while ((m = narrativeHeadingRe.exec(text)) !== null) {
+    narrativeStarts.push(m.index);
+  }
+
+  const rawCriteria = [];
+
+  for (let s = 0; s < sectionStarts.length; s++) {
+    const start = sectionStarts[s];
+    // End at the next rubric section OR the next narrative question heading, whichever comes first
+    const nextRubric    = sectionStarts[s + 1] ?? text.length;
+    const nextNarrative = narrativeStarts.find(n => n > start) ?? text.length;
+    const end = Math.min(nextRubric, nextNarrative);
+
+    const section = text.slice(start, end);
+    const lines = section.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (headerNoise.test(line) && line.length < 100) continue;
+      if (summaryTableRe.test(line)) break; // stop at summary table
+      if (/^\d+$/.test(line)) continue;
+
+      // Look ahead up to 3 lines for a standalone integer (the marks value)
+      for (let j = 1; j <= 3 && i + j < lines.length; j++) {
+        const ahead = lines[i + j];
+        if (/^\d+$/.test(ahead) && Number(ahead) > 0 && Number(ahead) <= 100) {
+          rawCriteria.push({ name: line, marks: Number(ahead) });
+          i += j;
+          break;
+        }
+      }
+    }
+  }
+
+  if (rawCriteria.length === 0) return text;
+
+  // Determine the most common (mode) marks value — summary rows typically differ from it
+  const marksCounts = {};
+  rawCriteria.forEach(c => { marksCounts[c.marks] = (marksCounts[c.marks] || 0) + 1; });
+  const modeMarks = parseInt(Object.entries(marksCounts).sort((a, b) => b[1] - a[1])[0][0]);
+
+  // Filter out: rows whose marks are > 1.5× the mode (likely summary/aggregate rows)
+  const filtered = rawCriteria.filter(c => c.marks <= modeMarks * 1.5);
+
+  // Deduplicate: skip any criterion whose key words largely overlap with an earlier one
+  function keywords(s) {
+    return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 4);
+  }
+  const deduped = [];
+  for (const c of filtered) {
+    const kw = keywords(c.name);
+    const isDupe = deduped.some(existing => {
+      const overlap = kw.filter(w => keywords(existing.name).includes(w)).length;
+      return overlap >= 2;
+    });
+    if (!isDupe) deduped.push(c);
+  }
+
+  const criteriaLines = deduped.map(c => `- ${c.name} (${c.marks} marks)`);
+  const totalMarks = deduped.reduce((s, c) => s + c.marks, 0);
+
+  const summary =
+    `GRADING CRITERIA (extracted from rubric — total: ${totalMarks} marks):\n` +
+    criteriaLines.join("\n") + "\n\n---\n\n";
+
+  console.log("[cleanRubricText] extracted criteria:\n" + criteriaLines.join("\n") +
+    `\nTotal: ${totalMarks} marks`);
+  return summary + text;
+}
+
+// System prompt — explicit about using ONLY the rubric's criteria, no invention.
+// Also instructs the model to use rubric band descriptors (Excellent/Good/Adequate/Poor)
+// to derive principled scores rather than guessing arbitrary numbers.
 const GRADING_SYSTEM_PROMPT = `You are a strict academic grader. Evaluate the student submission using ONLY the criteria listed in the rubric.
 
 CRITICAL RULES:
 1. The "criteria" array MUST contain EXACTLY ONE entry per question/criterion in the rubric — no more, no less.
 2. Do NOT invent, merge, or skip any criterion. Use the exact criterion names from the rubric.
-3. Every criterion entry MUST include "maxScore" — read it directly from the rubric. NEVER omit or set it to 0 unless the rubric says 0.
-4. "score" must be between 0 and "maxScore" for that criterion.
-5. "totalScore" MUST equal the exact arithmetic sum of all criterion "score" values.
-6. "maxScore" at the top level MUST equal the exact arithmetic sum of all criterion "maxScore" values.
-7. Return ONLY a single flat JSON object — no nested objects, no markdown fences, no explanation.
+3. MARKS/maxScore rule:
+   a. If the rubric explicitly states marks for a criterion (e.g. "Q1 [10 marks]"), use that number as maxScore.
+   b. If the rubric does NOT state any marks at all, assume a total of 100 marks distributed EQUALLY across all criteria. For example, 4 criteria → each maxScore = 25.
+   c. NEVER set maxScore to 0 unless the rubric explicitly says 0 marks for that criterion.
+4. BAND-BASED SCORING — if the rubric defines quality bands (e.g. Excellent / Good / Adequate / Poor, or Outstanding / Satisfactory / Needs Improvement, or similar), you MUST:
+   a. Read the band descriptors carefully for each criterion.
+   b. Determine which band the student's answer falls into based on the descriptors.
+   c. Derive the numeric score from the band's percentage range applied to the criterion's maxScore:
+      - Excellent / Outstanding (90–100%): score = round(maxScore × 0.95)
+      - Good / Proficient      (70–89%):  score = round(maxScore × 0.80)
+      - Adequate / Satisfactory (50–69%): score = round(maxScore × 0.60)
+      - Poor / Insufficient    (<50%):    score = round(maxScore × 0.30)
+   d. In the feedback field, explicitly state which band was awarded and WHY (e.g. "Band: Good — the student correctly identified most management functions but lacked depth in the 'controlling' analysis.").
+5. "score" must be between 0 and "maxScore" for that criterion.
+6. "totalScore" MUST equal the exact arithmetic sum of all criterion "score" values.
+7. "maxScore" at the top level MUST equal the exact arithmetic sum of all criterion "maxScore" values.
+8. Return ONLY a single flat JSON object — no nested objects, no markdown fences, no explanation.
 
 Required JSON format (copy this structure exactly):
 {
@@ -50,8 +158,8 @@ Required JSON format (copy this structure exactly):
   "grade": "<A/B/C/D/F>",
   "overallComment": "<2-3 sentence summary>",
   "criteria": [
-    { "name": "<criterion 1 name>", "score": <number>, "maxScore": <number from rubric>, "feedback": "<feedback>" },
-    { "name": "<criterion 2 name>", "score": <number>, "maxScore": <number from rubric>, "feedback": "<feedback>" }
+    { "name": "<criterion 1 name>", "score": <number>, "maxScore": <number>, "feedback": "<band + reason>" },
+    { "name": "<criterion 2 name>", "score": <number>, "maxScore": <number>, "feedback": "<band + reason>" }
   ]
 }`;
 
@@ -148,9 +256,23 @@ function validateAndCorrect(data, studentName) {
   else if (pct >= 50) data.grade = "D";
   else                data.grade = "F";
 
-  // Warn if all criteria have maxScore=0 (model omitted them)
+  // Safety net: if all criteria still have maxScore=0 (rubric had no marks),
+  // infer equal distribution over 100 so scores are never silently zeroed out.
   if (data.criteria.length > 0 && data.maxScore === 0) {
-    console.warn(`[validateAndCorrect] WARNING: "${data.studentName}" — all criteria have maxScore=0. The model likely omitted maxScores. Scores may be unreliable.`);
+    console.warn(`[validateAndCorrect] "${data.studentName}" — all maxScores are 0 (rubric had no marks). Inferring equal distribution over 100.`);
+    const equalMax = Math.round(100 / data.criteria.length);
+    data.criteria = data.criteria.map((c) => ({
+      ...c,
+      maxScore: equalMax,
+      // Re-clamp score now that we have a real maxScore
+      score: Math.min(c.score > 0 ? c.score : Math.round(equalMax * 0.7), equalMax),
+    }));
+    // Recompute totals with the inferred values
+    data.totalScore = data.criteria.reduce((sum, c) => sum + c.score, 0);
+    data.maxScore   = data.criteria.reduce((sum, c) => sum + c.maxScore, 0);
+    data.percentage = Math.round((data.totalScore / data.maxScore) * 1000) / 10;
+    const pct2 = data.percentage;
+    data.grade = pct2 >= 90 ? "A" : pct2 >= 75 ? "B" : pct2 >= 60 ? "C" : pct2 >= 50 ? "D" : "F";
   }
 
   // Note: we do NOT enforce a strict criterion count because a student may
@@ -241,17 +363,37 @@ Return ONLY the corrected JSON, nothing else.`;
  * @param {string} params.studentName    - Name of the student being graded
  * @returns {Promise<Object>} Parsed, validated JSON grade result
  */
-async function gradeWithAI({ taskText, submissionText, rubricText, studentName }) {
-  // Truncate each section to stay within GitHub Models' 8 000-token request limit
-  const safeTask       = truncate(taskText,       TASK_CHAR_LIMIT);
-  const safeRubric     = truncate(rubricText,     RUBRIC_CHAR_LIMIT);
-  const safeSubmission = truncate(submissionText, SUBMISSION_CHAR_LIMIT);
+async function gradeWithAI({ taskText, submissionText, rubricText, studentName, totalMarks = null, modelAnswerText = null }) {
+  // Clean up the rubric table format before truncating
+  const cleanedRubric = cleanRubricText(rubricText);
+
+  // Truncate each section to fit within the 32K-token context window of Qwen2.5:14b
+  const safeTask        = truncate(taskText,        TASK_CHAR_LIMIT);
+  const safeRubric      = truncate(cleanedRubric,   RUBRIC_CHAR_LIMIT);
+  const safeSubmission  = truncate(submissionText,  SUBMISSION_CHAR_LIMIT);
+  const safeModelAnswer = modelAnswerText
+    ? truncate(modelAnswerText, MODEL_ANSWER_CHAR_LIMIT)
+    : null;
+
+  // Tell the model the total marks if the user specified them, so it can distribute
+  // maxScores correctly even when the rubric doesn't list marks per criterion.
+  const marksHint = totalMarks
+    ? `The assignment is marked out of ${totalMarks} total marks. Distribute these equally across all criteria if the rubric does not specify marks per criterion.`
+    : `If the rubric does not specify marks per criterion, assume a total of 100 marks distributed equally.`;
+
+  // Build the model-answer section only when one was provided
+  const modelAnswerSection = safeModelAnswer
+    ? `\n## Model Answer / Ideal Solution (use as reference for quality comparison — do NOT simply check if the student copied it)\n${safeModelAnswer}\n`
+    : "";
 
   const userMessage = `## Assignment Task
 ${safeTask}
 
 ## Grading Rubric
 ${safeRubric}
+${modelAnswerSection}
+## Marks
+${marksHint}
 
 ## Student Name
 ${studentName}
@@ -259,10 +401,11 @@ ${studentName}
 ## Student Submission
 ${safeSubmission}
 
-STEP 1 — Before writing any JSON, silently count the number of distinct criteria/questions in the rubric above. Write down that count.
-STEP 2 — Your "criteria" array MUST have EXACTLY that many entries — one per rubric criterion, no more, no less.
-STEP 3 — For each criterion, read its maxScore directly from the rubric. NEVER leave maxScore as 0 unless the rubric explicitly gives it 0 marks.
-STEP 4 — Return ONLY the final JSON object. No markdown, no explanation, no extra keys.`;
+STEP 1 — Read the rubric carefully and count EVERY distinct criterion/question (including sub-criteria like Q1a, Q1b).
+STEP 2 — Your "criteria" array MUST have EXACTLY that many entries — one per rubric criterion.
+STEP 3 — For each criterion, identify which quality band (Excellent/Good/Adequate/Poor or equivalent) the student's answer falls into, then convert to a numeric score using the band percentage ranges.
+STEP 4 — Set each criterion's maxScore from the rubric. NEVER leave maxScore as 0.
+STEP 5 — Return ONLY the final JSON object. No markdown, no explanation, no extra keys.`;
 
   const rawText = await withRetry(async () => {
     const response = await client.chat.completions.create({
