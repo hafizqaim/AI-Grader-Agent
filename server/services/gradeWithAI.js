@@ -1,21 +1,64 @@
 const OpenAI = require("openai");
 
-// Ollama endpoint — set OLLAMA_BASE_URL in .env to use a remote instance (e.g. Colab+ngrok).
-// Falls back to local Ollama if not set.
-const client = new OpenAI({
-  baseURL: (process.env.OLLAMA_BASE_URL || "http://localhost:11434") + "/v1",
-  apiKey: "ollama",
-  timeout: 10 * 60 * 1000,
-});
+// ── AI Backend Selection ──────────────────────────────────────────────────────
+// Priority:
+//   1. MISTRAL_API_KEY set → use Mistral API (cloud, no GPU needed)
+//   2. Otherwise           → use Ollama (local or Colab+ngrok)
+//
+// To use Mistral: add MISTRAL_API_KEY=your_key to server/.env
+// To use Colab:   set OLLAMA_BASE_URL=<ngrok_url> and OLLAMA_CONCURRENCY=3
+// To use local:   leave both unset (defaults to http://localhost:11434)
+
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const USING_MISTRAL   = !!MISTRAL_API_KEY;
+
+let client, MODEL_NAME;
+
+if (USING_MISTRAL) {
+  // Mistral API — uses OpenAI-compatible SDK pointed at Mistral's endpoint
+  client = new OpenAI({
+    baseURL: "https://api.mistral.ai/v1",
+    apiKey:  MISTRAL_API_KEY,
+    timeout: 5 * 60 * 1000, // Mistral is fast — 5 min is plenty
+  });
+  // Default to mistral-medium-latest; override with MISTRAL_MODEL env var
+  MODEL_NAME = process.env.MISTRAL_MODEL || "mistral-medium-latest";
+  console.log(`[gradeWithAI] Backend: Mistral API (model: ${MODEL_NAME})`);
+} else {
+  // Ollama — local or remote Colab+ngrok
+  client = new OpenAI({
+    baseURL: (process.env.OLLAMA_BASE_URL || "http://localhost:11434") + "/v1",
+    apiKey:  "ollama",
+    timeout: 10 * 60 * 1000,
+  });
+  MODEL_NAME = process.env.OLLAMA_MODEL || "qwen2.5:14b";
+  console.log(`[gradeWithAI] Backend: Ollama (model: ${MODEL_NAME}, url: ${process.env.OLLAMA_BASE_URL || "http://localhost:11434"})`);
+}
 
 // ── Config ───────────────────────────────────────────────────────────────────
-// qwen2.5:14b — best fit for Colab T4 (15 GB VRAM, ~9 GB used).
-// Much stronger at structured JSON output and instruction-following than mistral:7b.
-// Falls back gracefully to mistral:7b if MODEL_NAME is overridden via env var.
-const MODEL_NAME    = process.env.OLLAMA_MODEL || "qwen2.5:14b";
 const MAX_TOKENS    = 10000; // qwen3:14b needs room for <think> block (~2-4K) + JSON response
 const MAX_RETRIES   = 3;
 const INITIAL_DELAY = 2000;
+
+// ── Mistral free-tier throttle ────────────────────────────────────────────────
+// Free-tier Mistral allows ~1-2 requests/minute depending on the model.
+// A proactive gap between calls avoids hitting 429 in the first place.
+// When a 429 still occurs the retry handler waits a full 65 s (just over 1 minute).
+const MISTRAL_MIN_CALL_INTERVAL_MS = 12000; // 12 s gap ≈ 5 req/min — safe for free tier
+let   _lastMistralCallAt = 0;
+
+async function callAI(params) {
+  if (USING_MISTRAL) {
+    const elapsed = Date.now() - _lastMistralCallAt;
+    const gap     = MISTRAL_MIN_CALL_INTERVAL_MS - elapsed;
+    if (gap > 0) {
+      console.log(`[gradeWithAI] Mistral throttle: waiting ${(gap / 1000).toFixed(1)}s before next request…`);
+      await new Promise(r => setTimeout(r, gap));
+    }
+    _lastMistralCallAt = Date.now();
+  }
+  return client.chat.completions.create(params);
+}
 
 // qwen2.5:14b supports 32K context tokens — ~4 chars/token → 128K char budget.
 // Distribute generously so long rubrics (with narrative model answers) are never truncated.
@@ -289,16 +332,69 @@ async function withRetry(fn, retries = MAX_RETRIES, delay = INITIAL_DELAY) {
     try {
       return await fn();
     } catch (err) {
+      // ── Connection refused ──────────────────────────────────────────────────
       if (err?.code === "ECONNREFUSED") {
+        if (USING_MISTRAL) {
+          throw new Error("Cannot connect to Mistral API. Check your internet connection.");
+        }
         throw new Error(
           "Cannot connect to Ollama. Make sure Ollama is running (`ollama serve`) " +
-          "and the model is pulled (`ollama pull mistral:7b`)."
+          "and the model is pulled (`ollama pull qwen2.5:14b`)."
         );
       }
 
+      // ── Mistral-specific errors (auth + rate limits) ────────────────────────
+      if (USING_MISTRAL) {
+        // Invalid API key — do not retry, fail immediately with clear message
+        if (err?.status === 401 || err?.status === 403) {
+          throw new Error(
+            "MISTRAL_AUTH_ERROR: Invalid or missing Mistral API key. " +
+            "Check MISTRAL_API_KEY in server/.env."
+          );
+        }
+
+        if (err?.status === 429) {
+          // Determine if this is a hard monthly quota or a soft per-minute rate limit.
+          // Mistral returns a 'retry-after' header: large value (hours/days) = monthly cap.
+          const retryAfterRaw =
+            err?.headers?.["retry-after"] ||
+            err?.response?.headers?.["retry-after"];
+          const retryAfterSec = retryAfterRaw ? parseInt(retryAfterRaw, 10) : 0;
+          const errMsg = String(err?.message || "").toLowerCase();
+          const isMonthlyLimit =
+            errMsg.includes("month") ||
+            errMsg.includes("quota") ||
+            retryAfterSec > 3600; // >1 hour wait = not a minute-level rate limit
+
+          if (isMonthlyLimit) {
+            throw new Error(
+              "MISTRAL_QUOTA_EXCEEDED: Monthly free-tier token limit exhausted. " +
+              "Add a payment method at https://console.mistral.ai or switch to Ollama (Colab)."
+            );
+          }
+
+          if (attempt === retries) {
+            throw new Error(
+              `MISTRAL_RATE_LIMIT: Mistral API rate limit hit after ${retries} retries. ` +
+              "Try grading fewer submissions at once, or wait a minute and try again."
+            );
+          }
+
+          // Respect the retry-after header; fall back to 65 s minimum.
+          // Mistral free tier resets on a per-minute window — 5 s was never enough.
+          const waitMs = retryAfterSec > 0
+            ? retryAfterSec * 1000
+            : Math.max(65000, delay * Math.pow(2, attempt - 1));
+          console.warn(`[gradeWithAI] Mistral rate limit (attempt ${attempt}/${retries}). Waiting ${(waitMs / 1000).toFixed(0)}s…`);
+          await new Promise((res) => setTimeout(res, waitMs));
+          continue;
+        }
+      }
+
+      // ── Generic transient errors (Ollama crash, server errors, etc.) ────────
       const isTransient =
         err?.status === 429 ||
-        err?.status === 500 || // Ollama runner crash — wait and retry
+        err?.status === 500 ||
         String(err?.message).toLowerCase().includes("rate") ||
         String(err?.message).toLowerCase().includes("quota") ||
         String(err?.message).toLowerCase().includes("terminated");
@@ -337,7 +433,7 @@ ${brokenText}
 Return ONLY the corrected JSON, nothing else.`;
 
   try {
-    const response = await client.chat.completions.create({
+    const response = await callAI({
       model: MODEL_NAME,
       max_tokens: MAX_TOKENS,
       response_format: { type: "json_object" },
@@ -408,7 +504,7 @@ STEP 4 — Set each criterion's maxScore from the rubric. NEVER leave maxScore a
 STEP 5 — Return ONLY the final JSON object. No markdown, no explanation, no extra keys.`;
 
   const rawText = await withRetry(async () => {
-    const response = await client.chat.completions.create({
+    const response = await callAI({
       model: MODEL_NAME,
       max_tokens: MAX_TOKENS,
       response_format: { type: "json_object" }, // force JSON mode in Ollama

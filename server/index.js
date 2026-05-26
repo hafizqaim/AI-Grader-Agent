@@ -26,6 +26,18 @@ app.use((req, _res, next) => {
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.use("/api", gradeRouter);
 
+// ── Backend status ────────────────────────────────────────────────────────────
+app.get("/api/status", (_req, res) => {
+  const usingMistral = !!process.env.MISTRAL_API_KEY;
+  res.json({
+    backend:   usingMistral ? "mistral" : "ollama",
+    model:     usingMistral
+      ? (process.env.MISTRAL_MODEL || "mistral-medium-latest")
+      : (process.env.OLLAMA_MODEL  || "qwen2.5:14b"),
+    ollamaUrl: usingMistral ? null : (process.env.OLLAMA_BASE_URL || "http://localhost:11434"),
+  });
+});
+
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => res.json({ status: "AI Grader API is running." }));
 

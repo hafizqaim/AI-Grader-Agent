@@ -11,8 +11,11 @@ const { detectPlagiarism } = require("../services/detectPlagiarism");
 const router = express.Router();
 
 // ── Fix 2: Concurrency limiter ───────────────────────────────────────────────
-// 1 for local Ollama on 4GB GPU; increase to 3 when using Colab/remote Ollama.
-const CONCURRENCY_LIMIT = parseInt(process.env.OLLAMA_CONCURRENCY || "1", 10);
+// Mistral free tier: force 1 (API is rate-limited; parallel calls just hit 429)
+// Ollama: respect OLLAMA_CONCURRENCY (1 local, 3 for Colab)
+const CONCURRENCY_LIMIT = process.env.MISTRAL_API_KEY
+  ? 1
+  : parseInt(process.env.OLLAMA_CONCURRENCY || "1", 10);
 
 async function limitedParallel(items, asyncFn) {
   const results = new Array(items.length);
