@@ -13,7 +13,7 @@ const client = new OpenAI({
 // Much stronger at structured JSON output and instruction-following than mistral:7b.
 // Falls back gracefully to mistral:7b if MODEL_NAME is overridden via env var.
 const MODEL_NAME    = process.env.OLLAMA_MODEL || "qwen2.5:14b";
-const MAX_TOKENS    = 3000;  // larger model can produce richer responses
+const MAX_TOKENS    = 10000; // qwen3:14b needs room for <think> block (~2-4K) + JSON response
 const MAX_RETRIES   = 3;
 const INITIAL_DELAY = 2000;
 
@@ -420,8 +420,12 @@ STEP 5 — Return ONLY the final JSON object. No markdown, no explanation, no ex
     return response.choices[0].message.content.trim();
   });
 
-  // Strip markdown code fences if the model wraps JSON in them
-  const jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  // Strip qwen3 thinking blocks (<think>...</think>) then markdown code fences
+  const jsonText = rawText
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")  // remove thinking traces
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
 
   let parsed;
   try {
