@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import axios from "axios";
 import FileUploader from "./components/FileUploader";
 import GradeReport from "./components/GradeReport";
@@ -19,6 +19,13 @@ export default function App() {
   const [plagiarism, setPlagiarism] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [backendInfo, setBackendInfo] = useState(null);
+
+  useEffect(() => {
+    axios.get("http://localhost:5000/api/status")
+      .then(({ data }) => setBackendInfo(data))
+      .catch(() => {}); // silently ignore — the badge just won't show
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -88,7 +95,13 @@ export default function App() {
           <span className="text-3xl">🎓</span>
           <div>
             <h1 className="text-2xl font-extrabold text-gray-900 leading-tight">AI Assignment Grader</h1>
-            <p className="text-sm text-gray-500">Powered by Qwen2.5 14B (Ollama)</p>
+            <p className="text-sm text-gray-500">
+              {backendInfo
+                ? backendInfo.backend === "mistral"
+                  ? `Powered by ${backendInfo.model} (Mistral API)`
+                  : `Powered by ${backendInfo.model} (Ollama)`
+                : "Powered by AI"}
+            </p>
           </div>
         </div>
       </header>
@@ -169,11 +182,55 @@ export default function App() {
               </div>
             </div>
 
-            {error && (
-              <div className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
-                <span className="font-semibold">Error: </span>{error}
-              </div>
-            )}
+            {error && (() => {
+              const isMistralAuth  = error.includes("MISTRAL_AUTH_ERROR");
+              const isMistralQuota = error.includes("MISTRAL_QUOTA_EXCEEDED");
+              const isMistralRate  = error.includes("MISTRAL_RATE_LIMIT");
+              const cleanMsg = error
+                .replace(/^MISTRAL_AUTH_ERROR:\s*/,  "")
+                .replace(/^MISTRAL_QUOTA_EXCEEDED:\s*/, "")
+                .replace(/^MISTRAL_RATE_LIMIT:\s*/, "");
+
+              if (isMistralAuth) {
+                return (
+                  <div className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
+                    <p className="font-bold mb-1">Mistral API Key Error</p>
+                    <p>{cleanMsg}</p>
+                    <p className="mt-1 text-red-500">Generate a key at{" "}
+                      <a href="https://console.mistral.ai/api-keys" target="_blank" rel="noreferrer" className="underline font-semibold">console.mistral.ai/api-keys</a>
+                      {" "}and paste it into <code>server/.env</code> as <code>MISTRAL_API_KEY=...</code>
+                    </p>
+                  </div>
+                );
+              }
+              if (isMistralQuota) {
+                return (
+                  <div className="rounded-xl bg-orange-50 border border-orange-200 px-4 py-3 text-sm text-orange-800">
+                    <p className="font-bold mb-1">Mistral Free-Tier Monthly Limit Reached</p>
+                    <p>{cleanMsg}</p>
+                    <p className="mt-1 text-orange-600">Options:<br/>
+                      • Add a payment method at{" "}
+                      <a href="https://console.mistral.ai" target="_blank" rel="noreferrer" className="underline font-semibold">console.mistral.ai</a><br/>
+                      • Or switch to Ollama: clear <code>MISTRAL_API_KEY</code> in <code>server/.env</code> and set <code>OLLAMA_BASE_URL</code> to your Colab ngrok URL.
+                    </p>
+                  </div>
+                );
+              }
+              if (isMistralRate) {
+                return (
+                  <div className="rounded-xl bg-yellow-50 border border-yellow-200 px-4 py-3 text-sm text-yellow-800">
+                    <p className="font-bold mb-1">Mistral Rate Limit Hit</p>
+                    <p>{cleanMsg}</p>
+                    <p className="mt-1 text-yellow-700">The free tier allows a limited number of requests per minute. Wait 60 seconds and try again, or upload fewer submissions per batch.</p>
+                  </div>
+                );
+              }
+              return (
+                <div className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
+                  <span className="font-semibold">Error: </span>{error}
+                </div>
+              );
+            })()}
 
             <button
               type="submit"

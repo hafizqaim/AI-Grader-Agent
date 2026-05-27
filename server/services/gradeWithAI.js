@@ -140,16 +140,28 @@ function cleanRubricText(text) {
   // Filter out: rows whose marks are > 1.5× the mode (likely summary/aggregate rows)
   const filtered = rawCriteria.filter(c => c.marks <= modeMarks * 1.5);
 
-  // Deduplicate: skip any criterion whose key words largely overlap with an earlier one
+  // Deduplicate: skip any criterion whose key words largely overlap with an earlier one.
+  // Exception: criteria that differ by a sub-part marker like (a)/(b) are NOT duplicates
+  // even when they share all other keywords (e.g. "Advantages ... (a)" vs "Advantages ... (b)").
   function keywords(s) {
     return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 4);
+  }
+  // Returns the trailing sub-part letter/number if present, e.g. "(a)" → "a", "(2)" → "2"
+  function subPart(s) {
+    const m = s.match(/\(\s*([a-zA-Z0-9])\s*\)\s*$/);
+    return m ? m[1].toLowerCase() : null;
   }
   const deduped = [];
   for (const c of filtered) {
     const kw = keywords(c.name);
+    const spC = subPart(c.name);
     const isDupe = deduped.some(existing => {
       const overlap = kw.filter(w => keywords(existing.name).includes(w)).length;
-      return overlap >= 2;
+      if (overlap < 2) return false;
+      // Different sub-part markers (a) vs (b) → treat as distinct criteria, not duplicates
+      const spE = subPart(existing.name);
+      if (spC !== null && spE !== null && spC !== spE) return false;
+      return true;
     });
     if (!isDupe) deduped.push(c);
   }
@@ -243,7 +255,7 @@ function extractCriteria(obj) {
 }
 
 // ── Validate and correct the AI's JSON output ───────────────────────────────
-function validateAndCorrect(data, studentName) {
+function validateAndCorrect(data, studentName, expectedMaxScore = null) {
   // Always use the canonical student name (from the filename)
   data.studentName = studentName;
 
@@ -318,12 +330,115 @@ function validateAndCorrect(data, studentName) {
     data.grade = pct2 >= 90 ? "A" : pct2 >= 75 ? "B" : pct2 >= 60 ? "C" : pct2 >= 50 ? "D" : "F";
   }
 
-  // Note: we do NOT enforce a strict criterion count because a student may
-  // legitimately split one question into sub-parts (e.g. Q1a + Q1b).
-  // The important invariant is that totalScore/maxScore is computed from the
-  // actual criteria list, which is enforced above.
+  // Normalize to a single assignment-wide max score when we can infer it.
+  // Policy:
+  // - If AI max is LOWER than expected, keep awarded marks as-is and add missing
+  //   marks as zero (represents unaddressed rubric portion).
+  // - If AI max is HIGHER than expected, proportionally scale down to expected.
+  // This prevents mixed outputs like some students graded out of 70 and others out of 80.
+  if (expectedMaxScore && expectedMaxScore > 0 && data.maxScore > 0) {
+    const eps = 0.0001;
+    if (Math.abs(data.maxScore - expectedMaxScore) > eps) {
+      const actualBefore = data.maxScore;
+
+      // Case A: AI returned too few total marks (e.g. 70 instead of 80)
+      // Add a zero-scored remainder criterion instead of scaling awarded marks up.
+      if (data.maxScore < expectedMaxScore) {
+        const missing = Math.round((expectedMaxScore - data.maxScore) * 100) / 100;
+        if (Array.isArray(data.criteria)) {
+          data.criteria.push({
+            name: "Unaddressed rubric criterion(s)",
+            score: 0,
+            maxScore: missing,
+            feedback: "One or more rubric criteria were not evidenced in the submission.",
+          });
+          data.totalScore = data.criteria.reduce((sum, c) => sum + c.score, 0);
+          data.maxScore   = data.criteria.reduce((sum, c) => sum + c.maxScore, 0);
+        } else {
+          data.maxScore = expectedMaxScore;
+        }
+      } else {
+        // Case B: AI returned too many total marks (e.g. 90 instead of 80)
+        // Scale down proportionally so percentages remain consistent.
+        const factor = expectedMaxScore / data.maxScore;
+        if (Array.isArray(data.criteria) && data.criteria.length > 0) {
+          data.criteria = data.criteria.map((c) => {
+            const scaledMax = Math.max(0, Math.round(c.maxScore * factor * 100) / 100);
+            const scaledScore = Math.max(0, Math.round(c.score * factor * 100) / 100);
+            return {
+              ...c,
+              maxScore: scaledMax,
+              score: Math.min(scaledScore, scaledMax),
+            };
+          });
+          data.totalScore = data.criteria.reduce((sum, c) => sum + c.score, 0);
+          data.maxScore   = data.criteria.reduce((sum, c) => sum + c.maxScore, 0);
+
+          // Correct small rounding drift to hit the expected total exactly.
+          const drift = Math.round((expectedMaxScore - data.maxScore) * 100) / 100;
+          if (Math.abs(drift) > eps && data.criteria.length > 0) {
+            const last = data.criteria[data.criteria.length - 1];
+            const newLastMax = Math.max(0, Math.round((last.maxScore + drift) * 100) / 100);
+            data.criteria[data.criteria.length - 1] = {
+              ...last,
+              maxScore: newLastMax,
+              score: Math.min(last.score, newLastMax),
+            };
+            data.totalScore = data.criteria.reduce((sum, c) => sum + c.score, 0);
+            data.maxScore   = data.criteria.reduce((sum, c) => sum + c.maxScore, 0);
+          }
+        } else {
+          data.totalScore = Math.round((data.totalScore * factor) * 100) / 100;
+          data.maxScore   = expectedMaxScore;
+        }
+      }
+
+      data.percentage = data.maxScore > 0
+        ? Math.round((data.totalScore / data.maxScore) * 1000) / 10
+        : 0;
+
+      const pct3 = data.percentage;
+      data.grade = pct3 >= 90 ? "A" : pct3 >= 75 ? "B" : pct3 >= 60 ? "C" : pct3 >= 50 ? "D" : "F";
+
+      console.warn(
+        `[validateAndCorrect] "${data.studentName}" maxScore normalized ${actualBefore} -> ${expectedMaxScore}`
+      );
+    }
+  }
 
   return data;
+}
+
+function deriveExpectedMaxScore(cleanedRubric, totalMarks, rawRubricText = "") {
+  const explicitTotal = Number(totalMarks);
+  if (Number.isFinite(explicitTotal) && explicitTotal > 0) {
+    return explicitTotal;
+  }
+
+  // Prefer explicit totals found in the original rubric text (more reliable than
+  // extracted criteria if one criterion was missed by extraction).
+  const candidates = [];
+  const rawPatterns = [
+    /(?:total\s+marks?|maximum\s+marks?|max\s+marks?)\s*[:\-]?\s*(\d{2,4})/gi,
+    /out\s+of\s*(\d{2,4})\s*marks?/gi,
+  ];
+  for (const re of rawPatterns) {
+    let mm;
+    while ((mm = re.exec(rawRubricText)) !== null) {
+      const n = Number(mm[1]);
+      if (Number.isFinite(n) && n > 0 && n <= 1000) candidates.push(n);
+    }
+  }
+  if (candidates.length > 0) {
+    return Math.max(...candidates);
+  }
+
+  const m = cleanedRubric.match(/GRADING CRITERIA \(extracted from rubric [^)]* total:\s*(\d+)\s*marks\):/i);
+  if (m) {
+    const parsed = Number(m[1]);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
 }
 
 // ── Fix 2: Exponential-backoff retry around any async fn ────────────────────
@@ -462,6 +577,7 @@ Return ONLY the corrected JSON, nothing else.`;
 async function gradeWithAI({ taskText, submissionText, rubricText, studentName, totalMarks = null, modelAnswerText = null }) {
   // Clean up the rubric table format before truncating
   const cleanedRubric = cleanRubricText(rubricText);
+  const expectedMaxScore = deriveExpectedMaxScore(cleanedRubric, totalMarks, rubricText);
 
   // Truncate each section to fit within the 32K-token context window of Qwen2.5:14b
   const safeTask        = truncate(taskText,        TASK_CHAR_LIMIT);
@@ -548,7 +664,7 @@ STEP 5 — Return ONLY the final JSON object. No markdown, no explanation, no ex
     }
   }
 
-  return validateAndCorrect(parsed, studentName);
+  return validateAndCorrect(parsed, studentName, expectedMaxScore);
 }
 
 module.exports = { gradeWithAI };
