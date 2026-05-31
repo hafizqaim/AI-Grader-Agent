@@ -1,4 +1,5 @@
 const OpenAI = require("openai");
+const { buildWebSearchContext, isResearchAssignment } = require("./webSearch");
 
 // ── AI Backend Selection ──────────────────────────────────────────────────────
 // Priority:
@@ -598,12 +599,23 @@ async function gradeWithAI({ taskText, submissionText, rubricText, studentName, 
     ? `\n## Model Answer / Ideal Solution (use as reference for quality comparison — do NOT simply check if the student copied it)\n${safeModelAnswer}\n`
     : "";
 
+  // Web search — auto-enabled for research assignments when TAVILY_API_KEY is set
+  let webSearchSection = "";
+  if (process.env.TAVILY_API_KEY && isResearchAssignment(taskText + " " + rubricText)) {
+    console.log(`[gradeWithAI] Research assignment detected — running web search for "${studentName}"…`);
+    const ctx = await buildWebSearchContext(submissionText, taskText);
+    if (ctx) {
+      webSearchSection = "\n" + ctx + "\n";
+      console.log(`[gradeWithAI] Web search context injected for "${studentName}"`);
+    }
+  }
+
   const userMessage = `## Assignment Task
 ${safeTask}
 
 ## Grading Rubric
 ${safeRubric}
-${modelAnswerSection}
+${modelAnswerSection}${webSearchSection}
 ## Marks
 ${marksHint}
 

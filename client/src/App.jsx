@@ -62,12 +62,24 @@ export default function App() {
       // set it automatically so it includes the correct multipart boundary.
       setResults(data.grades);
       setPlagiarism(data.plagiarism || []);
-      if (data.errorGrades?.length > 0) {
-        setError(
-          `⚠️ ${data.errorGrades.length} submission(s) could not be graded (AI returned an unreadable response): ` +
-          data.errorGrades.map(g => g.studentName).join(", ") +
-          ". All other students were graded successfully."
+
+      // Combine warnings about skipped (unreadable) files and AI-grading failures into one message
+      const warnings = [];
+      if (data.skipped?.length > 0) {
+        warnings.push(
+          `⚠️ ${data.skipped.length} submission(s) skipped — could not extract readable text ` +
+          `(likely scanned images or image-only PDFs): ` +
+          data.skipped.map(s => s.studentName).join(", ")
         );
+      }
+      if (data.errorGrades?.length > 0) {
+        warnings.push(
+          `⚠️ ${data.errorGrades.length} submission(s) could not be graded (AI returned an unreadable response): ` +
+          data.errorGrades.map(g => g.studentName).join(", ")
+        );
+      }
+      if (warnings.length > 0) {
+        setError(warnings.join("\n\n") + "\n\nAll other students were graded successfully.");
       }
     } catch (err) {
       const msg =
@@ -101,6 +113,11 @@ export default function App() {
                   ? `Powered by ${backendInfo.model} (Mistral API)`
                   : `Powered by ${backendInfo.model} (Ollama)`
                 : "Powered by AI"}
+              {backendInfo?.webSearch && (
+                <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
+                  🌐 Web Search
+                </span>
+              )}
             </p>
           </div>
         </div>

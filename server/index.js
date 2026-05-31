@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const gradeRouter = require("./routes/grade");
+const gradeRouter       = require("./routes/grade");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -35,6 +35,7 @@ app.get("/api/status", (_req, res) => {
       ? (process.env.MISTRAL_MODEL || "mistral-medium-latest")
       : (process.env.OLLAMA_MODEL  || "qwen2.5:14b"),
     ollamaUrl: usingMistral ? null : (process.env.OLLAMA_BASE_URL || "http://localhost:11434"),
+    webSearch: !!process.env.TAVILY_API_KEY,
   });
 });
 

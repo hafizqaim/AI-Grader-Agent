@@ -161,22 +161,33 @@ router.post("/grade", (req, res, next) => {
       })
     );
 
-    // Fix 4: warn about empty submissions (scanned / image-only PDFs)
-    const emptySubmissions = submissionData.filter((s) => s.text.trim().length < 50);
-    if (emptySubmissions.length > 0) {
-      const names = emptySubmissions.map((s) => s.name).join(", ");
+    // Fix 4: skip submissions we couldn't extract text from (scanned / image-only PDFs).
+    // Instead of aborting the whole batch, we filter them out and report them at the end.
+    const skippedSubmissions = submissionData
+      .filter((s) => s.text.trim().length < 50)
+      .map((s) => ({
+        studentName: s.name,
+        reason: "Could not extract readable text (likely a scanned image or image-only PDF).",
+      }));
+    const readableSubmissions = submissionData.filter((s) => s.text.trim().length >= 50);
+
+    if (skippedSubmissions.length > 0) {
+      console.warn(`[grade] skipping ${skippedSubmissions.length} unreadable submission(s):`,
+        skippedSubmissions.map(s => s.studentName).join(", "));
+    }
+
+    if (readableSubmissions.length === 0) {
       return res.status(400).json({
-        error: `Could not extract readable text from the following submission(s): ${names}. ` +
-               `These files may be scanned images or image-only PDFs. ` +
-               `Please upload text-based PDF or DOCX files.`,
+        error: "None of the uploaded submissions contained readable text. All files appear to be scanned images or image-only PDFs.",
+        skipped: skippedSubmissions,
       });
     }
 
     // Grade ALL submissions including re-uploads — best score per student is kept below
-    const total = submissionData.length;
+    const total = readableSubmissions.length;
     let done = 0;
     console.log(`[grade] grading all ${total} submissions to find best per student...`);
-    const allGrades = await limitedParallel(submissionData, async ({ name, text }) => {
+    const allGrades = await limitedParallel(readableSubmissions, async ({ name, text }) => {
       const result = await gradeWithAI({ taskText, submissionText: text, rubricText, studentName: name, totalMarks, modelAnswerText });
       done++;
       console.log(`[grade] graded ${done}/${total}: ${name}`);
@@ -233,7 +244,7 @@ router.post("/grade", (req, res, next) => {
     deleteFile(namingFile.path);
 
     console.log("[grade] done — sending response");
-    return res.json({ grades: successGrades, errorGrades, plagiarism });
+    return res.json({ grades: successGrades, errorGrades, skipped: skippedSubmissions, plagiarism });
   } catch (err) {
     console.error("Grading error:", err);
     return res.status(500).json({ error: err.message || "An unexpected error occurred." });
