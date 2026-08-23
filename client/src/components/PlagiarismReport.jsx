@@ -1,7 +1,10 @@
+import { motion } from "framer-motion";
+import { ShieldCheck, Search } from "lucide-react";
+
 const SEVERITY_STYLES = {
-  HIGH:   { badge: "bg-red-100 text-red-700 ring-red-400",    bar: "bg-red-500",    label: "High Risk" },
-  MEDIUM: { badge: "bg-orange-100 text-orange-700 ring-orange-400", bar: "bg-orange-400", label: "Medium Risk" },
-  LOW:    { badge: "bg-yellow-100 text-yellow-700 ring-yellow-400", bar: "bg-yellow-400", label: "Low Risk" },
+  HIGH:   { badge: "bg-red-400/15 text-red-300 ring-red-400/30",       bar: "from-red-400 to-rose-500",     label: "High Risk" },
+  MEDIUM: { badge: "bg-orange-400/15 text-orange-300 ring-orange-400/30", bar: "from-orange-400 to-amber-400", label: "Medium Risk" },
+  LOW:    { badge: "bg-yellow-400/15 text-yellow-300 ring-yellow-400/30", bar: "from-yellow-400 to-amber-300", label: "Low Risk" },
 };
 
 /**
@@ -12,12 +15,14 @@ const SEVERITY_STYLES = {
 export default function PlagiarismReport({ pairs }) {
   if (!pairs || pairs.length === 0) {
     return (
-      <section className="rounded-2xl bg-white border border-green-200 shadow-sm p-6">
+      <section className="glass-card rounded-2xl border-emerald-400/20 p-6">
         <div className="flex items-center gap-3">
-          <span className="text-2xl">✅</span>
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-400/10">
+            <ShieldCheck className="h-5 w-5 text-emerald-300" />
+          </div>
           <div>
-            <h2 className="text-lg font-bold text-green-800">No Plagiarism Detected</h2>
-            <p className="text-sm text-green-600">All submissions appear sufficiently distinct from one another.</p>
+            <h2 className="text-base font-bold text-emerald-300">No Plagiarism Detected</h2>
+            <p className="text-sm text-slate-400">All submissions appear sufficiently distinct from one another.</p>
           </div>
         </div>
       </section>
@@ -31,29 +36,31 @@ export default function PlagiarismReport({ pairs }) {
   return (
     <section className="flex flex-col gap-4">
       {/* Header */}
-      <div className="rounded-2xl bg-red-50 border border-red-200 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="glass-card flex flex-col gap-4 rounded-2xl border-red-400/15 p-5 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
-          <span className="text-2xl">🔍</span>
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-400/10">
+            <Search className="h-5 w-5 text-red-300" />
+          </div>
           <div>
-            <h2 className="text-xl font-bold text-gray-900">Plagiarism Detection Results</h2>
-            <p className="text-sm text-gray-500">
+            <h2 className="font-display text-lg font-bold text-white">Plagiarism Detection Results</h2>
+            <p className="text-sm text-slate-400">
               {pairs.length} suspicious {pairs.length === 1 ? "pair" : "pairs"} found
             </p>
           </div>
         </div>
-        <div className="flex gap-2 flex-wrap">
+        <div className="flex flex-wrap gap-2">
           {highCount > 0 && (
-            <span className="rounded-full bg-red-100 text-red-700 ring-1 ring-red-400 px-3 py-1 text-xs font-bold">
+            <span className="rounded-full bg-red-400/15 px-3 py-1 text-xs font-bold text-red-300 ring-1 ring-inset ring-red-400/30">
               {highCount} High
             </span>
           )}
           {mediumCount > 0 && (
-            <span className="rounded-full bg-orange-100 text-orange-700 ring-1 ring-orange-400 px-3 py-1 text-xs font-bold">
+            <span className="rounded-full bg-orange-400/15 px-3 py-1 text-xs font-bold text-orange-300 ring-1 ring-inset ring-orange-400/30">
               {mediumCount} Medium
             </span>
           )}
           {lowCount > 0 && (
-            <span className="rounded-full bg-yellow-100 text-yellow-700 ring-1 ring-yellow-400 px-3 py-1 text-xs font-bold">
+            <span className="rounded-full bg-yellow-400/15 px-3 py-1 text-xs font-bold text-yellow-300 ring-1 ring-inset ring-yellow-400/30">
               {lowCount} Low
             </span>
           )}
@@ -64,55 +71,61 @@ export default function PlagiarismReport({ pairs }) {
       {pairs.map((pair, i) => {
         const style = SEVERITY_STYLES[pair.severity] || SEVERITY_STYLES.LOW;
         return (
-          <div key={i} className="rounded-2xl bg-white border border-gray-200 shadow-sm px-5 py-4">
-            <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+          <motion.div
+            key={i}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35, delay: Math.min(i * 0.04, 0.3) }}
+            className="glass-card rounded-2xl px-5 py-4"
+          >
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
               {/* Student names */}
-              <div className="flex-1 flex items-center gap-3 min-w-0">
-                <div className="flex flex-col items-center gap-1 min-w-0">
-                  <span className="font-bold text-gray-900 truncate max-w-[140px]">{pair.student1}</span>
-                  <span className="text-xs text-gray-400">Roll No.</span>
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <div className="flex min-w-0 flex-col items-center gap-1">
+                  <span className="max-w-[140px] truncate font-bold text-white">{pair.student1}</span>
+                  <span className="text-[11px] text-slate-500">Roll No.</span>
                 </div>
-                <span className="text-gray-400 font-bold text-lg shrink-0">↔</span>
-                <div className="flex flex-col items-center gap-1 min-w-0">
-                  <span className="font-bold text-gray-900 truncate max-w-[140px]">{pair.student2}</span>
-                  <span className="text-xs text-gray-400">Roll No.</span>
+                <span className="shrink-0 text-lg font-bold text-slate-600">↔</span>
+                <div className="flex min-w-0 flex-col items-center gap-1">
+                  <span className="max-w-[140px] truncate font-bold text-white">{pair.student2}</span>
+                  <span className="text-[11px] text-slate-500">Roll No.</span>
                 </div>
               </div>
 
               {/* Similarity bar + scores */}
               <div className="flex flex-col gap-1 sm:w-64">
-                <div className="flex items-center justify-between text-xs text-gray-500">
+                <div className="flex items-center justify-between text-[11px] text-slate-500">
                   <span>Overall Similarity</span>
-                  <span className="font-bold text-gray-800">{pair.similarity}%</span>
+                  <span className="font-bold text-slate-200">{pair.similarity}%</span>
                 </div>
-                <div className="h-2.5 w-full overflow-hidden rounded-full bg-gray-100">
+                <div className="h-2 w-full overflow-hidden rounded-full bg-white/5">
                   <div
-                    className={`h-full rounded-full transition-all duration-700 ${style.bar}`}
+                    className={`h-full rounded-full bg-gradient-to-r transition-all duration-700 ${style.bar}`}
                     style={{ width: `${pair.similarity}%` }}
                   />
                 </div>
                 {/* Individual method scores */}
-                <div className="flex justify-between text-xs text-gray-400 mt-0.5">
-                  <span>Verbatim: <span className="font-medium text-gray-600">{pair.jaccardScore}%</span></span>
-                  <span>Paraphrase: <span className="font-medium text-gray-600">{pair.tfidfScore}%</span></span>
+                <div className="mt-0.5 flex justify-between text-[11px] text-slate-500">
+                  <span>Verbatim: <span className="font-medium text-slate-300">{pair.jaccardScore}%</span></span>
+                  <span>Paraphrase: <span className="font-medium text-slate-300">{pair.tfidfScore}%</span></span>
                 </div>
               </div>
 
               {/* Severity + method badges */}
-              <div className="flex flex-col items-end gap-1.5 shrink-0">
+              <div className="flex shrink-0 flex-col items-end gap-1.5">
                 <span className={`rounded-full px-3 py-1 text-xs font-bold ring-1 ring-inset ${style.badge}`}>
                   {style.label}
                 </span>
-                <span className="rounded-full bg-gray-100 text-gray-600 px-2 py-0.5 text-xs font-medium">
+                <span className="rounded-full bg-white/5 px-2 py-0.5 text-xs font-medium text-slate-400">
                   {pair.method}
                 </span>
               </div>
             </div>
-          </div>
+          </motion.div>
         );
       })}
 
-      <p className="text-xs text-gray-400 text-right">
+      <p className="text-right text-[11px] text-slate-600">
         Detection: Jaccard k-shingle (verbatim) + TF-IDF cosine (paraphrase) &nbsp;|&nbsp; Threshold ≥ 20%
       </p>
     </section>
